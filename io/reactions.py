@@ -25,7 +25,7 @@
 
 import re
 
-from cno.misc import CNOError
+from nn_cno.misc import CNOError
 
 __all__ = ["Reaction", "Reactions"]
 

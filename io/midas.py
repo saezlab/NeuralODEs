@@ -2549,9 +2549,9 @@ class Trend(object):
     def _normed(self, v):
         sumsq = np.sqrt(sum([this**2 for this in v]))
         if np.isnan(sumsq):
-            return np.nan
+            return np.array([np.nan]*len(v))
         elif sumsq == 0:
-            return 0
+            return np.array([0.0]*len(v))
         else:
             return v/sumsq
 

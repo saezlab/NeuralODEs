@@ -19,7 +19,7 @@ import csv
 import os
 import re
 
-from cno.io.reactions import Reactions, Reaction
+from nn_cno.io.reactions import Reactions, Reaction
 
 
 import numpy as np
