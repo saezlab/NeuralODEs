@@ -29,7 +29,6 @@ import matplotlib
 import pylab
 import networkx as nx
 
-
 try:
     import pygraphviz as gv
 except ImportError:

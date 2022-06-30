@@ -29,6 +29,8 @@ from nn_cno.core.results import ODEResults
 from nn_cno.core import ReportODE
 from nn_cno.core.params import ParamsSSM
 
+from nn_cno.ode.graph2symODE import graph_to_symODE
+
 # from biokit.rtools import bool2R
 
 from nn_cno.core.params import params_to_update
@@ -37,27 +39,8 @@ from easydev import Logging
 __all__ = ["NNODE"]
 
 
-class NNODE(CNOBase, CNORBase):
+class NNODE(CNOBase):
     """Neural network based ODE modeling 
-
-    ::
-
-        c = pipeline.CNObool("PKN-test.sif", "MD-test.csv")
-        c.optimise(compression=True, expansion=True, reltol=.15)
-
-
-    Results are stored in :attr:`results`. Information stored are various.
-    The errors corresponding to the best models can be visualised with :meth:`plot_errors`
-    and models within the tolerance are stored in :attr:`models.
-
-    .. plot::
-        :include-source:
-
-        from cno import cnodata, NNode
-        c = NNODE(cnodata("PKN-ToyMMB.sif"),
-            cnodata("MD-ToyMMB.csv"))
-        c.optimise()
-        c.plot_errors()
 
     """
     def __init__(self, model=None, data=None, tag=None, verbose=True,
@@ -66,21 +49,16 @@ class NNODE(CNOBase, CNORBase):
         CNOBase.__init__(self,model, data, verbose=verbose, tag=tag, 
                 config=config, use_cnodata=use_cnodata)
         
-        self._report = ReportODE()
-
-        self.results = ODEResults()
-
         self.config.General.pknmodel.value = self.pknmodel.filename
         self.config.General.data.value = self.data.filename
 
-        # p = ParamsSSM()
-        # self.config.add_section(p)
+
 
         self.parameters = NNODEParameters(model=self._model, reaction_type=reaction_type)
         self._library = 'NNode'
         #CNORodePBMstNeu
 
-
+        
     @params_to_update
     def optimise(self,  n_diverse=10, dim_ref_set=10, maxtime=60,
                  verbose=False, reltol=1e-4, atol=1e-3, maxeval='Inf',
