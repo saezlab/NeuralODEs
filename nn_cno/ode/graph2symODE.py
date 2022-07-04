@@ -3,70 +3,151 @@ import sympy as sym
 from nn_cno.io.cnograph import CNOGraph
 import nn_cno
 
-# normalised Hill equations (for each reactions) ( x^n / (k^n + x^n) * {1/(1/k^n + 1)} )
-def norm_hill_fun(parental_var,n,k):
-    return parental_var**n / (k**n + parental_var**n) * (k**n + 1)
 
-def ORgate(x,y):
+def transfer_function_norm_hill_fun(parental_var,node):
+    """ Use Normalised Hill equation as transfer function
+    
+    Formulates the Hill equation as a symbolic equation with parameters.
+
+    Parameters
+        parental_var: sympy.Symbol
+            The parental variable.
+        node: sympy.Symbol or str
+            The current node name.
+        
+    Returns 
+        list:
+            A list of parameters and the symbolic equation.
+    """
+    k = sym.symbols(str(parental_var) + "_k_" + str(node))
+    n = sym.symbols(str(parental_var) + "_n_" + str(node))
+
+    return ([k, n], parental_var**n / (k**n + parental_var**n) * (k**n + 1))
+
+
+def transfer_function_linear(parental_var,node):
+    """ Use a linear expression as transfer function
+
+    Parameters
+        parental_var: sympy.Symbol
+            The parental variable.
+        node: sympy.Symbol or str
+            The current node name.
+        
+    Returns 
+        list:
+            A list of parameter and the symbolic equation.
+    """
+    k = sym.symbols(str(parental_var) + "_k_" + str(node))
+
+    return ([k], k*parental_var)
+
+def _ORgate(x,y):
     return x+y-x*y 
     
-def ANDgate(x,y):
+def _ANDgate(x,y):
     return x*y 
 
-def simple_reaction_to_sym(node,pred,sign):
-    par_k = sym.symbols(pred + "_k_" + node)
-    par_n = sym.symbols(pred + "_n_" + node)
-    pred_sym = sym.symbols(pred)
-    if sign == "+":
-        eqn = norm_hill_fun(pred_sym,par_n,par_k)
-    elif sign == "-":
-        eqn = 1-norm_hill_fun(pred_sym,par_n,par_k)
-    else:
-        raise Exception("unrecognised sign")
-        
-    return ([par_k, par_n], eqn)
+def _simple_reaction_to_sym(node, parent_node, sign, transfer_function):
+    """ Convert a simple reaction to a symbolic equation and parameters.
+    
+    Parameters
+        node: str
+            The name of the node.
+        pred: str
+            The name of the predecessor node.
+        sign: str
+            The sign of the reaction.
+        transfer_function: function
+            The transfer function to use. normalised_hill_fun by default.
+            The transfer function must take the following arguments:
+                parental_var: sympy.Symbol
+                    The parental variable.
+                node: sympy.Symbol or str
+                    The current node name.
+
+    Returns
+        list:
+            A list of parameters and the symbolic equation.
+"""
+
+    parent_sym = sym.symbols(parent_node)
+    node_sym = sym.symbols(node)
+    pars, eqn = transfer_function(parent_sym,node_sym)
+    if sign == "-":
+        eqn = 1-eqn
+    return (pars, eqn)
 
 
-# creates the symbolic equations and parameters corresponding to and AND reaction
-# node: (str) the name of the node
-# and_inputs: vec(str,str) length-2 str vector storing the inputs of the AND gates.   
-def and_reaction_to_sym(node,and_inputs,signs):
+
+def _and_reaction_to_sym(node,and_inputs,signs, transfer_function):
+    """ Convert an AND reaction to a symbolic equation and parameters.
+    
+    Parameters
+        node: str
+            The name of the node.
+        and_inputs: list
+            The names of the AND inputs.
+        signs: list
+            The signs of the AND inputs, can be '+' or '-'
+    Returns
+        list:
+            A list of parameters and the symbolic equation.
+    """
     eqns = list()
     params = list()
+    node_sym = sym.symbols(node)
+
     for n,sign in zip(and_inputs,signs):
-        
-        par_k = sym.symbols(n + "_k_" + node)
-        par_n = sym.symbols(n + "_n_" + node)
-        pred_sym = sym.symbols(n)
+        parent_sym = sym.symbols(n)
         if sign == "+":
-            eqn = norm_hill_fun(pred_sym,par_n,par_k)
+            pars, eqn = transfer_function(parent_sym,node_sym)
         elif sign == "-":
-            eqn = 1-norm_hill_fun(pred_sym,par_n,par_k)
+            pars, eqn = 1-transfer_function(parent_sym,node_sym)
         else:
             raise Exception("unrecognised sign")
         eqns.append(eqn)
-        params.append([par_k,par_n])
+        params.append(pars)
+    # combine with ANDgate
+    eqn = _ANDgate(eqns[0],eqns[1])
 
-    return(params,sym.prod(eqns))
+    return(params,eqn)
 
 
 
 # generate the right hand side for the node
-# 1. get the upstream nodes, 2 cases can happen: it is another node or it is an AND gate. 
-# 1.1 If the upstream is a regular state, convert the reaction into a hill equation and get the parameters
-# 1.2 If AND gate, then we have to go up one level, compute the hill equation and apply the AND -rule. 
-# 2. combine all the reactions with OR gates. 
-# 3. add the tau parameter and substract the current state
-def construct_symbolic_rhs(node, G):
+
+def _construct_symbolic_rhs(node, G,transfer_function):
+    """ Generate the right hand side for the node.
+        
+        Steps:
+        1. get the upstream nodes, 3 cases can happen: 
+            1.1. no upstream nodes -> rhs = 0
+            1.2. the upstream node is a regular state -> convert the reaction to a symbolic equation 
+            1.3. the upstream node is an AND node -> compute the symbolic equation based on the inputs of the AND node    
+        2. combine all the reactions with OR gates. 
+        3. add the tau parameter and substract the current state
+
+    Parameters
+        node: str
+            The name of the node.
+        G: CNOGraph
+            The graph.
+    Returns
+        list:
+            A list of parameters and the symbolic equation.
+    """
+    # get the upstream nodes
     and_nodes = G._find_and_nodes()
     if node in and_nodes:
         raise Exception("node mustn't be an AND gate node")
-
     preds = list(G.predecessors(node))
+    
     if len(preds) == 0:
         # no input edge: derivative is zero
         sym_eq = 0
         sym_parameters = []
+        return (sym_eq, sym_parameters)
     else:
         sym_reactions = list()
         sym_parameters = list()
@@ -75,17 +156,22 @@ def construct_symbolic_rhs(node, G):
             # upstream node is not an AND node: 
             if pred not in and_nodes:
                 sign = G.get_edge_data(pred,node)['link']
-                p,r = simple_reaction_to_sym(pred,node,sign)
+                p,r = _simple_reaction_to_sym(node=node,
+                                            parent_node=pred,
+                                            sign=sign,
+                                            transfer_function=transfer_function)
                 sym_reactions.append(r)
                 sym_parameters.append(p)
-                
-            # upstream is an AND node    
             else:
+                # upstream is an AND node    
                 and_inputs = list(G.predecessors(pred))
 
                 signs = [G.get_edge_data(inp,pred)["link"] for inp in and_inputs]
 
-                p,r = and_reaction_to_sym(node,and_inputs,signs)
+                p,r = _and_reaction_to_sym(node=node,
+                                            and_inputs=and_inputs,
+                                            signs=signs,
+                                            transfer_function=transfer_function)
                 sym_reactions.append(r)
                 sym_parameters.append(p)
         
@@ -95,17 +181,28 @@ def construct_symbolic_rhs(node, G):
         else:
             aggregated_or = sym_reactions[0]
             for i in range(1,len(sym_reactions)):
-                aggregated_or = ORgate(aggregated_or,sym_reactions[i])
+                aggregated_or = _ORgate(aggregated_or,sym_reactions[i])
             sym_eq = sym.symbols("tau_"+node) * (aggregated_or - sym.symbols(node))
 
-    return (sym_eq, sym_parameters)
+    return (sym_parameters, sym_eq )
 
 
-def graph_to_symODE(inp_graph):
+def graph_to_symODE(inp_graph,transfer_function=transfer_function_norm_hill_fun):
+    """ Convert a graph to a symbolic ODE.
+        
+    Parameters
+        inp_graph: CNOGraph
+            The graph in networkx format.
+    Returns
+        list:
+            A list of parameters and the symbolic equation.
+
+    """
     f_rhs_aut = list()
+    pars = list()
     for node in inp_graph.nodes -  inp_graph._find_and_nodes():
-        rhs, pars = construct_symbolic_rhs(node,inp_graph)
+        pars, rhs  = _construct_symbolic_rhs(node, inp_graph, transfer_function)
         f_rhs_aut.append(rhs)
         #print(rhs)
         #print(pars)
-    f_rhs_aut 
+    return (pars, f_rhs_aut)
