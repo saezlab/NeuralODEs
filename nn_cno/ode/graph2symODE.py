@@ -107,7 +107,7 @@ def _and_reaction_to_sym(node,and_inputs,signs, transfer_function):
         else:
             raise Exception("unrecognised sign")
         eqns.append(eqn)
-        params.append(pars)
+        params.extend(pars)
     # combine with ANDgate
     eqn = _ANDgate(eqns[0],eqns[1])
 
@@ -143,11 +143,12 @@ def _construct_symbolic_rhs(node, G,transfer_function):
         raise Exception("node mustn't be an AND gate node")
     preds = list(G.predecessors(node))
     
+    sym_parameters = list()
+
     if len(preds) == 0:
         # no input edge: derivative is zero
         sym_eq = 0
-        sym_parameters = []
-        return (sym_eq, sym_parameters)
+        return (sym_parameters, sym_eq)
     else:
         sym_reactions = list()
         sym_parameters = list()
@@ -161,7 +162,7 @@ def _construct_symbolic_rhs(node, G,transfer_function):
                                             sign=sign,
                                             transfer_function=transfer_function)
                 sym_reactions.append(r)
-                sym_parameters.append(p)
+                sym_parameters.extend(p)
             else:
                 # upstream is an AND node    
                 and_inputs = list(G.predecessors(pred))
@@ -173,36 +174,90 @@ def _construct_symbolic_rhs(node, G,transfer_function):
                                             signs=signs,
                                             transfer_function=transfer_function)
                 sym_reactions.append(r)
-                sym_parameters.append(p)
+                sym_parameters.extend(p)
         
         # combine with OR gates
+        sym_tau = sym.symbols("tau_"+node)
         if len(preds)==1:
-            sym_eq = sym.symbols("tau_"+node) * (sym_reactions[0] - sym.symbols(node))
+            sym_eq = sym_tau * (sym_reactions[0] - sym.symbols(node))
+            sym_parameters.append(sym_tau)
         else:
             aggregated_or = sym_reactions[0]
             for i in range(1,len(sym_reactions)):
                 aggregated_or = _ORgate(aggregated_or,sym_reactions[i])
-            sym_eq = sym.symbols("tau_"+node) * (aggregated_or - sym.symbols(node))
+            sym_eq =  sym_tau * (aggregated_or - sym.symbols(node))
+            sym_parameters.append(sym_tau)
 
     return (sym_parameters, sym_eq )
 
 
 def graph_to_symODE(inp_graph,transfer_function=transfer_function_norm_hill_fun):
     """ Convert a graph to a symbolic ODE.
+
+    The algotihm enumerates the nodes of the graph, they will be the states of the ODE system.
+    Then for each node, it determines the incoming edges.
+    The incoming edges (reactions) are then translated to symbolic expressions using the given transfer function. 
+    Each incoming edge is combined with AND and OR gates, depending on the structure of the
+    graph (note that there are AND gates which are represented as nodes).
+    The algorithm returns the list of equations and the list of model parameters.
         
     Parameters
         inp_graph: CNOGraph
             The graph in networkx format.
+        transfer_function: function
+            normalised_hill_fun by default. The transfer function to represent the interaction between species.
+            Current alternatives are transfer_function_linear_fun.
+            Make sure, the transfer function takes the following arguments:
+                parental_var: sympy.Symbol
+                    The parental variable.
+                node: sympy.Symbol or str
+                    The current node name.
+            and returns:
+                list:   A list of parameters and the symbolic equation.
+            when the transfer function is evaluated with numerical values, it should return numeric values in the [0, 1] interval.
     Returns
         list:
-            A list of parameters and the symbolic equation.
+            A list of parameters, states and the symbolic equation.
 
     """
-    f_rhs_aut = list()
-    pars = list()
-    for node in inp_graph.nodes -  inp_graph._find_and_nodes():
+    f_rhs_out = list()
+    pars_out = list()
+    states_out = list()   
+
+    for node in inp_graph.species:
+        states_out.append(sym.symbols(node))
         pars, rhs  = _construct_symbolic_rhs(node, inp_graph, transfer_function)
-        f_rhs_aut.append(rhs)
+        f_rhs_out.append(rhs)
+        pars_out.append(pars)
         #print(rhs)
         #print(pars)
-    return (pars, f_rhs_aut)
+    # flatten the parameters into a vector: 
+    pars_flat = list()
+    for par in pars_out:
+        if par != 0:
+            pars_flat.extend(par)
+
+    return (pars_flat,states_out,f_rhs_out)
+
+
+
+
+# vectorized version of sympy2jax. Converts the list of equations into a list of `jax` and `param` objects
+def sym2jax(sym_eqs,sym_params):
+    import sympy2jax
+    eqns = sym_eqs
+    # Construct a list of jax functions. 
+    f_jax = list()
+    f_jax_params = list()
+
+    for i_eq in eqns:
+        if i_eq==0:
+            f_jax.append(0)
+            f_jax_params.append(0)
+        else:
+            f, params = sympy2jax.sympy2jax(i_eq, sym_params)
+            f_jax.append(f)
+            f_jax_params.append(params)
+    return   f_jax, f_jax_params
+
+#f_jax, f_jax_params = symODEs2jax(f_sym)

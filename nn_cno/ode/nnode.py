@@ -16,11 +16,19 @@
 
 
 
+from queue import Empty
 import sys
 import os
 
 import pandas as pd
+import numpy as np
 import pylab
+import itertools
+import jax.numpy as jnp
+import jax
+import diffrax
+import matplotlib.pyplot as plt
+import optax
 
 from nn_cno.core import CNOBase, CNORBase
 from nn_cno.core.params import  OptionsBase
@@ -29,8 +37,8 @@ from nn_cno.core.results import ODEResults
 from nn_cno.core import ReportODE
 from nn_cno.core.params import ParamsSSM
 
-from nn_cno.ode.graph2symODE import graph_to_symODE
-
+from nn_cno.ode.graph2symODE import graph_to_symODE, sym2jax
+import nn_cno.ode.graph2symODE as graph2symODE
 # from biokit.rtools import bool2R
 
 from nn_cno.core.params import params_to_update
@@ -40,439 +48,360 @@ __all__ = ["NNODE"]
 
 
 class NNODE(CNOBase):
-    """Neural network based ODE modeling 
+    """JAX/Diffrax based ODE modeling 
 
+    Attributes:
+        jax_model : JAX/Diffrax ODE model
+             JAX compatible right hand side of the ODE model
+        ODE: dictionary
+            dictionary containing the parameters and initial conditions of the ODE model
+        symbolicODE: dictionary
+            dictionary containing the symbolic representation of the ODE model(parameters, states and equations)
+        conditions: list
+            list of dictionaries containing the conditions for each experimental condition. What are the nodes
+            stimulated, inhibited, measured, time of the simulation and the initial conditions(y0).
+        transfer_function: function
+            function that maps the state of the ODE model to the state of the network.
+        transfer_function_type: string
+            type of the transfer function. It can be "normalised_hill", "linear" or "custom"
+
+    TODOs:
+        - add logging: https://www.loggly.com/use-cases/6-python-logging-best-practices-you-should-be-aware-of/
+        - add a way to specify the initial conditions for the ODE model 
+        - add a way to specify the parameters for the ODE model
+        
     """
     def __init__(self, model=None, data=None, tag=None, verbose=True,
-                 config=None, use_cnodata=False, reaction_type = "lin-tanh"):
+                 config=None, use_cnodata=False, transfer_function_type = "normalised_hill",custom_transfer_function=None):
         
+        # the CNORbase class takes care of importing PKN and MIDAS files. 
         CNOBase.__init__(self,model, data, verbose=verbose, tag=tag, 
                 config=config, use_cnodata=use_cnodata)
         
         self.config.General.pknmodel.value = self.pknmodel.filename
         self.config.General.data.value = self.data.filename
 
+        # process the transfer function
+        self._set_transfer_function(transfer_function_type, custom_transfer_function)
 
+        # generate conditions from the MIDAS 
+        # not necessary: this is already called in _update_ODE_model
+        self._initialize_conditions()
 
-        self.parameters = NNODEParameters(model=self._model, reaction_type=reaction_type)
-        self._library = 'NNode'
+        # convert the network to a symbolic logicODE
+        self._update_ODE_model()
+
+        #self.parameters = NNODEParameters(model=self._model, reaction_type=reaction_type)
+        #self._library = 'NNode'
+
+    def _initialize_conditions(self):
+        """ initialize the conditions for the ODE model simulation
+
+        The conditions are a list of dictionaries. They contains information about the 
+        stimulated, inhibited and measured nodes, the initial values and the time range.
+        Must be called if MIDAS(self.midas) or network (self._model) changes to adjust initial conditions.
+        """
+        midas = self.midas
+
+        # convert the conditions from the pandas dataframe to a list of dictionaries
+        stimuli = midas.experiments.Stimuli
+        inhibitors = midas.experiments.Inhibitors
+
+        names_stimuli = midas.names_stimuli
+        names_inhibitors = midas.names_inhibitors
+
+        conditions = list()
+        for iexp in range(midas.nExps):
+            stimulated = list(itertools.compress(names_stimuli,stimuli.iloc[iexp,:]==1))
+            inhibited = list(itertools.compress(names_inhibitors,inhibitors.iloc[iexp,:]==1))
+            measured = list(midas.names_signals)
+            time = midas.times
+            y0 = self._initialize_y0(self._model.species, stimulated, inhibited)
+            conditions.append(dict(stimulated=stimulated, inhibited=inhibited, measured=measured, time=time, y0=y0))
+        self.conditions = conditions
+        self.measurements_df = jnp.array(self.midas.df.to_numpy(),dtype=jnp.float32)
+      
+
+    def _initialize_y0(self,species, stimulated, inhibited,default_value=0.0):
+        """Get the initial conditions for a single experimental condition, considering the perturbations
+
+        Parameters
+            species: list
+                list of species names
+            stimulated: list
+                list of stimulated species names
+            inhibited: list
+                list of inhibited species names
+            default_value: float
+                default value for the initial conditions
+        Returns
+            y0: numpy array
+        """
+        y0 = dict()
+        for s in species:
+            if s in stimulated:
+                y0[s] = 1.0
+            elif s in inhibited:
+                y0[s] = 0.0
+            else:
+                y0[s] = default_value
+        return y0
+
+    def _update_ODE_model(self):
+        """Generates the ODE model from the current network. Need to be called after changing the network."""
+        
+        pars, states, eqns = graph2symODE.graph_to_symODE(self._model, self.transfer_function)
+
+        # store states in fixed order: 
+        self.states = tuple([str(s) for s in states])      
+        # measurements_index is the index of the measured nodes in the state variabels. Needed to subset the simulation results fast. 
+        self.measurements_index = [ self.states.index(x) if x in self.states else None for x in self.midas.names_signals]
+
+        self.symbolicODE = dict(pars=pars, states=states, eqns=eqns)
+
+        # generate the numerical parameter vector from the symbolic parameters
+        self._initialize_ODEparameters()
+
+        # convert the symbolic logicODE to a JAX/Diffrax ODE
+        self.jax_model = graph2symODE.sym2jax(sym_eqs = self.symbolicODE["eqns"], sym_params=[*self.symbolicODE["pars"], *self.symbolicODE["states"]])
+
+    def _initialize_ODEparameters(self):
+        parNames = [str(p) for p in self.symbolicODE['pars']]
+        parameters = dict()
+        for p in parNames:
+            if 'tau' in p:
+                parameters[p] = 0.1
+            elif '_n_'  in p:
+                parameters[p] = 2.0
+            elif '_k_' in p:
+                parameters[p] = 1.0
+        
+        self.ODEparameters = parameters
+    
+    def get_ODEparameters(self):
+        return self.ODEparameters
+    
+    def set_ODEparameters(self, parameters):
+        self.ODEparameters = parameters
+
+    def preprocessing(self, expansion=False, compression=True, cutnonc=True, maxInputsPerGate=2):
+        """ Preprocessing of the network. Same as in CNORBase, but expansion is False by default. Also updates the ODE model."""
+        super().preprocessing(expansion, compression, cutnonc, maxInputsPerGate)
+        # after preprocessing, we need to update the ODE model and the conditions (initial values)
+        self._update_ODE_model()
+        self._initialize_conditions()
+        self.setup_simulation()
+        self.setup_optimization()
+        
+    def _set_transfer_function(self, transfer_function_type, custom_transfer_function):
+        """Set the transfer function to use for the ODE model.
+        
+        Attributes:
+        transfer_function_type: str
+            The type of transfer function to use: "normalised_hill", "lienar", "custom"
+            custom_transfer_function: function
+                Make sure, the transfer function takes the following arguments:
+                    parental_var: sympy.Symbol
+                        The parental variable.
+                    node: sympy.Symbol or str
+                        The current node name.
+                and returns:
+                    list:   A list of parameters and the symbolic equation.
+                when the transfer function is evaluated with numerical values, it should return numeric values in the [0, 1] interval.
+                """
+
+        valid_transfer_function_types = ["normalised_hill", "linear", "custom"]
+        if transfer_function_type not in valid_transfer_function_types:
+            raise ValueError("transfer_function_type must be one of %s" % valid_transfer_function_types)
+        self.transfer_function_type = transfer_function_type
+        
+        if transfer_function_type == "custom": 
+            if custom_transfer_function is None:
+                raise ValueError("custom_transfer_function must be a function")
+            self.transfer_function = custom_transfer_function
+        elif transfer_function_type == "normalised_hill":
+            self.transfer_function = graph2symODE.transfer_function_norm_hill_fun
+        elif transfer_function_type == "linear":
+            self.transfer_function = graph2symODE.transfer_function_linear_fun
         #CNORodePBMstNeu
 
+    
+
+    def get_rhs_function(self):
+        """ Generate a right hand side function compatible with Diffrax """
         
-    @params_to_update
-    def optimise(self,  n_diverse=10, dim_ref_set=10, maxtime=60,
-                 verbose=False, reltol=1e-4, atol=1e-3, maxeval='Inf',
-                 transfer_function=3, maxstepsize='Inf', reuse_ode_params=False,
-                 local_solver=None):
-        """Optimise the ODE parameters using SSM algorithm 
+        f_jax = self.jax_model[0]
+        f_jax_p = self.jax_model[1]
 
-        :param int maxtime: (default 10)
-        :param int ndiverse: (default 10)
-        :param int dim_refset: (default 10)
-        :param bool: ode_params if True, load the ode_params.RDAta file saved in a previous run
-            mus be compatible with the model.
-        
-        verbose should be False all the time internally to the R code. Here, verbose
-        meana we want to see the status of the optimisation (not all warnings and R
-        errors).
-        """
-        self.logging.info("Running the optimisation. Can take a very long"
-                        "time. To see the progression, set verboseR "
-                        "attribute to True")
-        # update config GA section with user parameters
-        self._update_config('SSM', self.optimise.actual_kwargs)
-        ssmd = self.config.SSM.as_dict()
+        def f(t, y, args):
+            # get users data containinf the jax objects and model parameters: 
+            #f_jax = args["jax_eqns"]
+            #f_jax_p = args["jax_parameters"]
+            parameter_vals = args["model_parameters"]
+            states = args["states"]
 
-        if self.session.get('ode_params') is None:
-            self.session.run('ode_params=NULL')
-        if reuse_ode_params is False:
-            self.session.run('ode_params=NULL')
+            #jax_pars = jnp.concatenate((parameter_vals,y))
+            jax_pars = [*parameter_vals,*y]
+            fy = list()
 
-        # todo: ode_params to be provided as input
-        script = """
-        library(%(library)s)
-        pknmodel = readSIF("%(pknmodel)s")
-        cnolist = CNOlist("%(midas)s")
-
-
-        model = preprocessing(cnolist, pknmodel, compression=%(compression)s,
-                   expansion=%(expansion)s, cutNONC=%(cutnonc)s,
-                   maxInputsPerGate=%(maxInputsPerGate)s)
-
-
-        reactions = model$reacID
-        species = colnames(cnolist@signals[[1]])
-
-
-        if (is.null(ode_params) == TRUE){
-         ode_params = createLBodeContPars(model)
-        }
-        ode_params = parEstimationLBodeSSm(cnolist, model, 
-            maxtime=%(maxtime)s, maxStepSize=%(maxstepsize)s, dim_refset=%(dim_ref_set)s, maxeval=%(maxeval)s,
-            verbose=F, ndiverse=%(n_diverse)s, ode_parameters=ode_params,
-            local_solver=%(local_solver)s)
-        """
-
-        if local_solver is None:
-            local_solver = 'NULL'
-        params = {
-                'library': self._library,
-            'pknmodel': self.pknmodel.filename,
-            'midas': self.data.filename,
-            'compression': bool2R(self._compression),
-            'expansion': bool2R(self._expansion),
-            'cutnonc': bool2R(self._cutnonc),
-             'maxInputsPerGate': self._max_inputs_per_gate,
-             'local_solver': local_solver
-            }
-
-        params.update(ssmd)
-
-        self.session.run(script % params)
-
-        ssm_results = self.session.ode_params['ssm_results'].copy()
-        self.ssm_results = ssm_results
-        results = {
-                'best_score': ssm_results['fbest'],
-                'all_scores': ssm_results['f'],
-                'reactions': self.session.reactions[:],
-                'best_params': ssm_results['xbest']
-        }
-        for k,v in list(self.session.ode_params.items()):
-            results[k] = v.copy()
-
-        self.results = ODEResults()
-        self.results.results = results
-        self.species = self.session.species
-
-    def plot_errors(self, show=True):
-        self._set_simulation()
-        self.midas.plot(mode="mse") 
-        #self.midas.plotSim()
-        if show is False:
-            pylab.close()
-
-    def simulate(self, params, verboseR=False):
-        # The first call is slow but then, it is faster but still
-        # 10 times slower than the pure R version
-        save_verboseR = self.verboseR
-        self.verboseR = verboseR
-        if self.session.get("simulator_initialised") is None:
-            script = """
-                library(%(library)s)
-                pknmodel = readSIF("%(pknmodel)s")
-                cnolist = CNOlist("%(midas)s")
-                model = preprocessing(cnolist, pknmodel, compression=%(compression)s,
-                   expansion=%(expansion)s, cutNONC=%(cutnonc)s,
-                   maxInputsPerGate=%(maxInputsPerGate)s)
-                indices = indexFinder(cnolist, model,verbose=FALSE)
-                ode_params = createLBodeContPars(model)
-                objective_function = getLBodeContObjFunction(cnolist, model,
-                    ode_params, indices)
-                simulator_initialised = T
-            """
-            pars = {
-                'library': self._library,
-                'pknmodel': self.pknmodel.filename,
-                'midas': self.data.filename,
-            'compression': bool2R(self._compression),
-            'expansion': bool2R(self._expansion),
-            'cutnonc': bool2R(self._cutnonc),
-             'maxInputsPerGate': self._max_inputs_per_gate,
-            }
-            self.session.run(script % pars)
-
-        self.session['params'] = params
-        script = """
-            score = objective_function(params)
-        """
-        self.session.run(script)
-        self.verboseR = save_verboseR
-        return self.session.score
-
-    def get_sim_data(self, bs=None):
-        """
-
-        input could be a bitstring with correct length and same order
-        OR a model
-
-        """
-        if bs is None:
-            bs = self.results.results.parValues
-        else:
-            # TODO check assert length bs is correct
-            pass
-
-        script_template = """
-        library(%(library)s)
-        pknmodel = readSIF("%(pknmodel)s")
-
-
-        cnolist = CNOlist("%(midas)s")
-        model = preprocessing(cnolist, pknmodel, compression=%(compression)s,
-                   expansion=%(expansion)s, cutNONC=%(cutnonc)s,
-                   maxInputsPerGate=%(maxInputsPerGate)s)
-        sim_data = plotLBodeFitness(cnolist,model, ode_parameters=ode_params)
-        """
-
-        params = {
-                'library': self._library,
-                'pknmodel': self.pknmodel.filename,
-                'midas': self.data.filename,
-
-            'compression': bool2R(self._compression),
-            'expansion': bool2R(self._expansion),
-            'cutnonc': bool2R(self._cutnonc),
-             'maxInputsPerGate': self._max_inputs_per_gate,
-                #'tag':tag
-                }
-        script = script_template % params
-        self.session.run(script)
-        # FIXME what about species/experiments
-
-        sim_data = self.session.sim_data
-        self.sim = pd.concat([pd.DataFrame(x, columns=self.species) 
-            for x in sim_data])
-
-    def _get_models(self):
-        return self.results.cnorbool.models
-    models = property(_get_models)
-
-    def _set_simulation(self):
-        self.get_sim_data()
-        self.midas.create_random_simulation()
-
-        Ntimes = len(self.midas.times)
-        Nexp = len(self.midas.experiments.index)
-        sim = self.sim.copy()
-        
-        sim['time'] = [time for time in self.midas.times for x in range(0, Nexp)]
-        sim['experiment'] = list(self.midas.experiments.index) * Ntimes
-        sim['cellLine'] = [self.midas.cellLines[0]] * sim.shape[0]
-        sim.set_index(['cellLine', 'experiment', 'time'], inplace=True)
-        sim.sortlevel(1, inplace=True)
-
-        self.midas.sim = sim.copy()
-
-    def plot_ode_parameters(self, **kargs):
-        pylab.figure(1);
-        self._plot_ode_parameters_k(**kargs)
-        pylab.figure(2)
-        self._plot_ode_parameters_n(**kargs)
-
-    def _plot_ode_parameters_k(self, **kargs):
-        kargs["edge_attribute"] = "ode_k"
-        r = ODEParameters(self.results.results.parNames, self.results.results.parValues)
-        data = r.get_k()
-        for e in self.cnograph.edges():
-            try:
-                self.cnograph.edge[e[0]][e[1]]["ode_k"] = data[e[0]][e[1]]
-                self.cnograph.edge[e[0]][e[1]]["label"] = " k=%.2f" % data[e[0]][e[1]]
-            except:
-                self.cnograph.edge[e[0]][e[1]]["ode_k"] = -1
-                self.cnograph.edge[e[0]][e[1]]["label"] = " k=??"
-                print(e)
-        self.cnograph.plot(**kargs)
-        # cleanup the label
-        for e in self.cnograph.edges():
-            del self.cnograph.edge[e[0]][e[1]]["label"]
-
-    def _plot_ode_parameters_n(self, **kargs):
-        kargs["edge_attribute"] = "ode_n"
-        r = ODEParameters(self.results.results.parNames, self.results.results.parValues)
-        data = r.get_n()
-        for e in self.cnograph.edges():
-            try:
-                self.cnograph.edge[e[0]][e[1]]["ode_n"] = data[e[0]][e[1]]
-                self.cnograph.edge[e[0]][e[1]]["label"] = " n=%.2f" % data[e[0]][e[1]]
-            except:
-                self.cnograph.edge[e[0]][e[1]]["ode_n"] = -1
-                self.cnograph.edge[e[0]][e[1]]["label"] = " n=??"
-                print(e)
-        self.cnograph.plot(**kargs)
-        # cleanup the label
-        for e in self.cnograph.edges():
-            del self.cnograph.edge[e[0]][e[1]]["label"]
-
-    def create_report_images(self):
-        model = self.cnograph.copy()
-        model.plot(filename=self._report._make_filename("pknmodel.svg"), show=False)
-        model.preprocessing()
-        model.plot(filename=self._report._make_filename("expmodel.png"), show=False)
-        self._plot_ode_parameters_k(filename=self._report._make_filename("ode_parameters_k.png"), 
-                show=False)
-        self._plot_ode_parameters_n(filename=self._report._make_filename("ode_parameters_n.png"), 
-                show=False)
-
-        self.plot_errors(show=True)
-        self._report.savefig("Errors.png")
-        
-        self.midas.plot()
-        self._report.savefig("midas.png")
-
-        pylab.close()
-        self.plot_fitness(show=True, save=False)
-        self._report.savefig("fitness.png")
-
-    def plot_fitness(self, show=True, save=False):
-        self.results.plot_fit()
-
-        if save is True:
-            self._report.savefig("fitness.png")
-
-        if show is False:
-            pylab.close()
-
-    def create_report(self):
-        self._create_report_header()
-
-        txt = """<pre class="literal-block">\n"""
-        #txt += "\n".join([x for x in self._script_optim.split("\n") if "write.csv" not in x])
-        txt += "o.report()\n</pre>\n"
-        self._report.add_section(txt, "Script used")
-        
-        txt = """<a href="http://www.cellnopt.org/">
-            <object data="pknmodel.svg" type="image/svg+xml">
-            <span>Your browser doesn't support SVG images</span> </object></a>"""
-        txt += """<a class="reference external image-reference" href="scripts/exercice_3.py">
-<img alt="MIDAS" class="align-right" src="midas.png" /></a>"""
-        
-        self._report.add_section(txt, "PKN graph", [("http://www.cellnopt.org", "cnograph")])
-                                                                                            
-        self._report.add_section('<img src="expmodel.png">', "Expanded before optimisation")
-        self._report.add_section( """
-        <img src="expmodel.png">'
-        <img src="ode_parameters_k.png">
-        <img src="ode_parameters_n.png">
-        """, "Optimised model")
+            for i in range(len(y)):
+                
+                if states[i] in args["condition"]["inhibited"]:
+                    fy.append(jnp.array([0.0,])[0])
+                elif f_jax[i] == 0:
+                    fy.append(jnp.array([0.0,])[0])
+                else:
+                    fy.append(f_jax[i](jnp.array([jax_pars,]),f_jax_p[1])[0])
                
-        self._report.add_section('<img src="fitness.png">', "Fitness")
-        self._report.add_section('<img src="Errors.png">', "Errors")
-
-        self._report.add_section(self._report.get_html_reproduce(), "Reproducibility")
-        fh = open(self._report.report_directory + os.sep + "rerun.py", 'w')
-        fh.write("from cellnopt.pipeline import *\n")
-        fh.write("CNOode(config=config.ini)\n")
-        fh.write("c.optimise()\n")
-        fh.write("c.report()\n")
-        fh.close()
-
-        # some stats
-        stats = self._get_stats()
-        txt = "<table>"
-        for k,v in iteritems(stats):
-            txt += "<tr><td>%s</td><td>%s</td></tr>" % (k,v)
-        txt += "</table>"
-        txt += """<img id="img" onclick='changeImage();' src="fit_over_time.png">\n"""
-        self._report.add_section(txt, "stats")
-
-        # dependencies
-        #table = self.get_table_dependencies()
-        #fh.write(table.to_html())
-
-        self._report.write("index.html")
-
-    def _get_stats(self):
-        res = {}
-        #res['Computation time'] = self.total_time
-        try:
-            res['Best Score'] = self.results.results['best_score']
-        except:
-            pass
-        return res
-
-class NNODEParameters(object):
-    """A class to handle ODE parameters for the neural network-based ODE model
-
-    """
-    def __init__(self, model, reaction_type="lin-tanh"):
+            return jnp.asarray(fy)
+                
         
+        return f
+
+    def setup_simulation(self):
+        # this is when jax generates the graph, takes some time. 
+        self.sim_function = self.get_rhs_function()
+        self._diffrax_ODEterm = diffrax.ODETerm(self.sim_function)
+
+
+    def simulate(self, ODEparameters=None, timepoints = None, stepsize_controller = diffrax.PIDController(atol=1e-3,rtol=1e-3), plot_simulation = False):
+        """Simulate the model with the given parameters and conditions
         
-        if reaction_type == "lin-tanh":
-            pass
-        else:
-            raise ValueError('reaction_type must be "lin-tanh" for now')
+        steps: 
+            1. gets the parameters
+            2. gets the conditions from the midas attributes
+            3. runs the simulation by calling the diffrax 
+
+        Attributes:
+        ODEparameters: list or jax.numpy.array of parameters
+            The parameters to use for the simulation. If None, the current parameters are used.
+        timepoints: array_like
+            The timepoints to use for the simulation in each condition. Useful to obtain smooth, high-res curves
+        stepsize_controller: diffrax.PIDController or diffrax.ConstantStepSize
+            Error control for the simulation of ODE systems. If None, the default PIDController is used with Atol=1e-3 and Rtol=1e-3.
+        plot_simulation: bool
+            If True, the simulation is plotted.
+
+        Returns:
+        simulation_results: list
+            A list containing the simulation results for each condition.
+        """
         
-        self.parValues = "parValues"
-        self.parNames = "parNames"
 
-    def get_n(self):
-        res = {}
-        for k,v in zip(self.parNames, self.parValues):
-            if "_n_" in k:
-                e1, e2 = k.split("_n_")
-                if e1 not in list(res.keys()):
-                    res[e1] = {}
-                if e2 not in list(res[e1].keys()):
-                    res[e1][e2] = v
-                else:
-                    raise KeyError
-        return res
+        # obtain numeric model parameters either from the user or from the object
+        if(ODEparameters is None):
+            parameters = jnp.array(list(self.get_ODEparameters().values()))
+        elif(isinstance(ODEparameters, dict)):
+            parameters = jnp.array(list(ODEparameters.values()))
+        elif(isinstance(ODEparameters, jax.numpy.ndarray)):
+            parameters = ODEparameters
+        else: 
+            raise TypeError("ODEparameters must be a dictionary or a jax.numpy.ndarray")
 
-    def get_k(self):
-        res = {}
-        for k,v in zip(self.parNames, self.parValues):
-            if "_k_" in k:
-                e1, e2 = k.split("_k_")
-                if e1 not in list(res.keys()):
-                    res[e1] = {}
-                if e2 not in list(res[e1].keys()):
-                    res[e1][e2] = v
-                else:
-                    raise KeyError
-        return res
-    def get_tau(self):
-        res = {}
-        for k,v in zip(self.parNames, self.parValues):
-            if "_n_" in k:
-                k = k.strip("tau_")
-                res[k] = v
-        return res
+        sim_conditions = self.conditions.copy()
+
+        if timepoints is not None:
+            for c in sim_conditions:
+                c["time"] = timepoints
+            
+        # run the simulation for each condition
+        simulation_data = list()
+        ODEsolver = diffrax.Heun()
+        
+        ODEterm = self._diffrax_ODEterm 
+        #jax_model = self.jax_model
+        states = self.states
+
+        for c in sim_conditions:
+            # run the simulation in a specific condition
+            user_data = dict(#jax_eqns = jax_model[0],
+                            #jax_parameters = jax_model[1],
+                            model_parameters = parameters,
+                            condition = c,
+                            states = states
+                            )
+            t0 = c["time"][0]
+            t1 = c["time"][-1]
+            y0 = jnp.array(list(c["y0"].values()))
+            ts = c["time"]
+            
+            sim_condition = diffrax.diffeqsolve(ODEterm, ODEsolver,
+                        t0=t0, t1=t1, dt0=0.1,
+                        y0=y0,
+                        args = user_data, 
+                        saveat=diffrax.SaveAt(ts=ts),
+                        stepsize_controller = stepsize_controller)
+
+            # add the simulation data to the list
+            simulation_data.append(sim_condition)
+        
+        if plot_simulation is True:
+            self.plot_simulation(simulation_data)
+        return simulation_data
+
+    def plot_simulation(self, simulation_data):
+        """Plot the simulation data"""
+        states = self.states
+
+        fig, axs= plt.subplots(len(states), len(simulation_data), figsize=(12,6))
+        for istate in range(len(states)):
+            for icond in range(len(simulation_data)):
+                axs[istate,icond].plot(simulation_data[icond].ts, simulation_data[icond].ys[:,istate])
+                
+                axs[istate,icond].set_xlabel("time")
+                axs[istate,icond].set_ylim(0,1)
+                if icond == 0:
+                    axs[istate,icond].set_ylabel(states[istate])
+                if istate == 0:
+                    axs[istate,icond].set_title("condition " + str(icond))
+
+    def fit(self, params=None, optimizer=None, max_iter=100, verbose=False):
+
+        if optimizer is None:
+            optimizer = optax.adam(learning_rate=1e-2)
+        
+        if(params is None):
+            params = jnp.array(list(self.get_ODEparameters().values()))
+        elif(isinstance(params, jax.numpy.ndarray)):
+            params = params
+        elif(isinstance(params, dict)):
+            params = jnp.array(list(params.values()))
+        else: 
+            raise TypeError("ODEparameters must be either a dictionary or a jax.numpy.ndarray")
 
 
-def standalone(args=None):
-    """This function is used by the standalone application called cellnopt_boolean
+        opt_state = optimizer.init(params)
 
-    ::
+        def step(params, opt_state):
+            loss_value, grads = jax.value_and_grad(self.loss_function)(params)
+            updates, opt_state = optimizer.update(grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
+            return params, opt_state, loss_value
 
-        cellnopt_ode --help
+        for i in range(max_iter):
+            params, opt_state, loss_value = step(params, opt_state)
+            if i % 10 == 0:
+                print(f'step {i}, loss: {loss_value}')
 
-    """
-    if args is None:
-        args = sys.argv[:]
+        return params
 
-    from cno.core.standalone import Standalone
-    user_options = OptionsODE()
-    stander = Standalone(args, user_options)
+    def setup_optimization(self):
+        self.loss_function = self.get_loss_function()
 
-    # just an alias
-    options = stander.options
+    def get_loss_function(self):
+        """Returns the loss function"""
+        
+        def loss(params):
 
-    if options.onweb is True or options.report is True:
-        trainer = CNORode(options.pknmodel, options.data, verbose=options.verbose,
-            verboseR=options.verboseR, config=options.config_file, 
-             use_cnodata=options.cnodata)
-        trainer.preprocessing()
-    else:
-        stander.help()
-
-    trainer.optimise(**stander.user_options.config.SSM.as_dict())
-
-    stander.trainer = trainer
-    stander.report()
-
-
-class OptionsODE(OptionsBase):
-    def __init__(self):
-        prog = "cno_ode_steady"
-        version = prog + " v1.0 (Thomas Cokelaer @2014)"
-        super(OptionsODE, self).__init__(version=version, prog=prog)
-        self.add_section(ParamsSSM())
-
-
-if __name__ == "__main__":
-    """Used by setup.py as an entry point to :func:`standalone`"""
-    standalone(sys.argv)
+            simulation_data = self.simulate(ODEparameters = params)
+             # extract the simulation data from the output of diffrax solution and subset it to the measured nodes. 
+            simulation_df = jnp.concatenate([jnp.asarray(s.ys[:,self.measurements_index]) for s in simulation_data])
+        
+            sq = jnp.power(simulation_df-self.measurements_df,2)
+            mse = jnp.sum(sq)/jnp.size(sq)
+            return mse
+        
+        return loss
 
 
 
