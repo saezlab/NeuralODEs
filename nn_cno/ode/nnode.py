@@ -1,21 +1,12 @@
 # -*- python -*-
 #
-#  This file is part of CNO software
-#
-#  Copyright (c) 2013-2014 - EBI-EMBL
-#
-#  File author(s): Thomas Cokelaer <cokelaer@ebi.ac.uk>
-#
-#  Distributed under the GPLv3 License.
-#  See accompanying file LICENSE.txt or copy at
-#      http://www.gnu.org/licenses/gpl-3.0.html
-#
-#  website: http://github.com/cellnopt/cellnopt
-#
-##############################################################################
+# license: GPLv3
+# author: Attila Gabor
+# date: 2022-07-11
+# version: 0.1
 
 
-
+from logging import warning
 from queue import Empty
 import sys
 import os
@@ -168,15 +159,30 @@ class NNODE(CNOBase):
     def _initialize_ODEparameters(self):
         parNames = [str(p) for p in self.symbolicODE['pars']]
         parameters = dict()
+        lb = dict()
+        ub = dict()
+        dz = dict()
         for p in parNames:
             if 'tau' in p:
                 parameters[p] = 0.1
+                lb[p] = 1e-3
+                ub[p] = 10.0
+                dz[p] = 1e-3
             elif '_n_'  in p:
                 parameters[p] = 2.0
+                lb[p] = 1
+                ub[p] = 5
+                dz[p] = 0.1
             elif '_k_' in p:
                 parameters[p] = 1.0
+                lb[p] = 1e-3 # DO NOT use 0.0 -> leads to division by zero
+                ub[p] = 10
+                dz[p] = 0.1
         
         self.ODEparameters = parameters
+        self.ODEparameters_lb = jnp.array(list(lb.values()))
+        self.ODEparameters_ub = jnp.array(list(ub.values()))
+        self.ODEparameters_dz = jnp.array(list(dz.values()))
     
     def get_ODEparameters(self):
         return self.ODEparameters
@@ -217,7 +223,7 @@ class NNODE(CNOBase):
         
         if transfer_function_type == "custom": 
             if custom_transfer_function is None:
-                raise ValueError("custom_transfer_function must be a function")
+                raise ValueError("custom_transfer_function is missing")
             self.transfer_function = custom_transfer_function
         elif transfer_function_type == "normalised_hill":
             self.transfer_function = graph2symODE.transfer_function_norm_hill_fun
@@ -251,7 +257,7 @@ class NNODE(CNOBase):
                 elif f_jax[i] == 0:
                     fy.append(jnp.array([0.0,])[0])
                 else:
-                    fy.append(f_jax[i](jnp.array([jax_pars,]),f_jax_p[1])[0])
+                    fy.append(f_jax[i](jnp.array([jax_pars,]),f_jax_p[i])[0])
                
             return jnp.asarray(fy)
                 
@@ -264,7 +270,7 @@ class NNODE(CNOBase):
         self._diffrax_ODEterm = diffrax.ODETerm(self.sim_function)
 
 
-    def simulate(self, ODEparameters=None, timepoints = None, stepsize_controller = diffrax.PIDController(atol=1e-3,rtol=1e-3), plot_simulation = False):
+    def simulate(self, ODEparameters=None, timepoints = None, stepsize_controller =diffrax.ConstantStepSize(), plot_simulation = False):
         """Simulate the model with the given parameters and conditions
         
         steps: 
@@ -278,7 +284,8 @@ class NNODE(CNOBase):
         timepoints: array_like
             The timepoints to use for the simulation in each condition. Useful to obtain smooth, high-res curves
         stepsize_controller: diffrax.PIDController or diffrax.ConstantStepSize
-            Error control for the simulation of ODE systems. If None, the default PIDController is used with Atol=1e-3 and Rtol=1e-3.
+            Error control for the simulation of ODE systems. If None, the default 
+             diffrax.PIDController(atol=1e-3,rtol=1e-3) PIDController is used with Atol=1e-3 and Rtol=1e-3.
         plot_simulation: bool
             If True, the simulation is plotted.
 
@@ -355,7 +362,7 @@ class NNODE(CNOBase):
                 if istate == 0:
                     axs[istate,icond].set_title("condition " + str(icond))
 
-    def fit(self, params=None, optimizer=None, max_iter=100, verbose=False):
+    def fit(self, params=None, optimizer=None, max_iter=100, boundary_handling = "penalty",  verbose=False):
 
         if optimizer is None:
             optimizer = optax.adam(learning_rate=1e-2)
@@ -374,6 +381,7 @@ class NNODE(CNOBase):
 
         def step(params, opt_state):
             loss_value, grads = jax.value_and_grad(self.loss_function)(params)
+
             updates, opt_state = optimizer.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
             return params, opt_state, loss_value
@@ -382,6 +390,7 @@ class NNODE(CNOBase):
             params, opt_state, loss_value = step(params, opt_state)
             if i % 10 == 0:
                 print(f'step {i}, loss: {loss_value}')
+                print(f'\tparams: {params}')
 
         return params
 
@@ -392,13 +401,44 @@ class NNODE(CNOBase):
         """Returns the loss function"""
         
         def loss(params):
+            lb = self.ODEparameters_lb
+            ub = self.ODEparameters_ub
+            dz = self.ODEparameters_dz
 
+            mse = 0.0
+            # penalize the parameters that are approaching the boundaries
+            for i in range(len(params)):
+                # if the parameter is close to the lower boundary, add a penalty
+                # lb[i]+dz[i] is the soft limit where the penalty is added
+                # we scale the interval between the soft and hard limit using tangent function that goes to infinite. 
+                # we add a multiplicative factor of 0.99 to prevent the penalty from being infinite an overloating.
+                if params[i] <= lb[i]+dz[i]:
+                    dept = (params[i]-lb[i])/dz[i]
+                    penalty = 1e3*jnp.power(dept,2)
+                    #penalty = jnp.tan(dept * jnp.pi/2 * 0.99)
+                    mse += penalty
+                    # print(f"WARNING: Parameter {i} is close to the lower boundary. Adding penalty {penalty}")
+
+                elif params[i] > ub[i]-dz[i]:
+                    dept = (ub[i] - params[i])/dz[i]
+                    #penalty = jnp.tan(dept * jnp.pi/2 * 0.99)
+                    penalty = 1e3*jnp.power(dept,2)
+                    mse += penalty
+                    # print(f"WARNING: Parameter {i} is close to the upper boundary. Adding penalty {penalty}")
+
+
+
+            # assure that parameters are within bounds for the simulation
+            params = jnp.clip(params, lb, ub)
+            
             simulation_data = self.simulate(ODEparameters = params)
+
              # extract the simulation data from the output of diffrax solution and subset it to the measured nodes. 
             simulation_df = jnp.concatenate([jnp.asarray(s.ys[:,self.measurements_index]) for s in simulation_data])
         
             sq = jnp.power(simulation_df-self.measurements_df,2)
-            mse = jnp.sum(sq)/jnp.size(sq)
+            mse += jnp.sum(sq)/jnp.size(sq)
+
             return mse
         
         return loss
