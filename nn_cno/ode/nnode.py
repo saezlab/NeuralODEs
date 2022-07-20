@@ -321,9 +321,7 @@ class NNODE(CNOBase):
 
         for c in sim_conditions:
             # run the simulation in a specific condition
-            user_data = dict(#jax_eqns = jax_model[0],
-                            #jax_parameters = jax_model[1],
-                            model_parameters = parameters,
+            user_data = dict(model_parameters = parameters,
                             condition = c,
                             states = states
                             )
@@ -362,7 +360,7 @@ class NNODE(CNOBase):
                 if istate == 0:
                     axs[istate,icond].set_title("condition " + str(icond))
 
-    def fit(self, params=None, optimizer=None, max_iter=100, boundary_handling = "penalty",  verbose=False):
+    def fit(self, params=None, optimizer=None, max_iter=100, boundary_handling = "penalty",  verbose=False, plot_convergence=False):
 
         if optimizer is None:
             optimizer = optax.adam(learning_rate=1e-2)
@@ -376,9 +374,13 @@ class NNODE(CNOBase):
         else: 
             raise TypeError("ODEparameters must be either a dictionary or a jax.numpy.ndarray")
 
+        if(plot_convergence is True):
+            from IPython.display import display, clear_output
+            fig = plt.figure()
+            axs = fig.add_subplot(1,1,1)    
 
         opt_state = optimizer.init(params)
-
+        
         def step(params, opt_state):
             loss_value, grads = jax.value_and_grad(self.loss_function)(params)
 
@@ -386,8 +388,21 @@ class NNODE(CNOBase):
             params = optax.apply_updates(params, updates)
             return params, opt_state, loss_value
 
+        convergence = list()
+        steps = list()
+        
         for i in range(max_iter):
             params, opt_state, loss_value = step(params, opt_state)
+            convergence.append(loss_value)
+            steps.append(i)
+            
+            if(plot_convergence is True):
+                axs.set_xlim(0,i)
+                axs.cla()
+                axs.plot(steps,convergence, marker = "o")
+                display(fig)
+                clear_output(wait=True)
+                
             if i % 10 == 0:
                 print(f'step {i}, loss: {loss_value}')
                 print(f'\tparams: {params}')
