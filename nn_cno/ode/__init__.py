@@ -16,4 +16,4 @@
 """
 
 from .cnorode import CNORode
-from .nnode import NNODE
+from .nnode import logicODE

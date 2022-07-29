@@ -35,7 +35,7 @@ from .core import *
 #from .feeder import Feeder
 
 # ODE
-from .ode import cnorode, CNORode, NNODE
+from .ode import cnorode, CNORode, logicODE
 
 # fuzzy
 #from .fuzzy import cnorfuzzy, CNORfuzzy

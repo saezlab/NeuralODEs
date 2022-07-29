@@ -35,10 +35,10 @@ import nn_cno.ode.graph2symODE as graph2symODE
 from nn_cno.core.params import params_to_update
 from easydev import Logging
 
-__all__ = ["NNODE"]
+__all__ = ["logicODE"]
 
 
-class NNODE(CNOBase):
+class logicODE(CNOBase):
     """JAX/Diffrax based ODE modeling 
 
     Attributes:
@@ -60,6 +60,7 @@ class NNODE(CNOBase):
         - add logging: https://www.loggly.com/use-cases/6-python-logging-best-practices-you-should-be-aware-of/
         - add a way to specify the initial conditions for the ODE model 
         - add a way to specify the parameters for the ODE model
+        - what does use_cnodata mean?
         
     """
     def __init__(self, model=None, data=None, tag=None, verbose=True,
@@ -75,15 +76,11 @@ class NNODE(CNOBase):
         # process the transfer function
         self._set_transfer_function(transfer_function_type, custom_transfer_function)
 
-        # generate conditions from the MIDAS 
-        # not necessary: this is already called in _update_ODE_model
-        self._initialize_conditions()
-
         # convert the network to a symbolic logicODE
         self._update_ODE_model()
 
-        #self.parameters = NNODEParameters(model=self._model, reaction_type=reaction_type)
-        #self._library = 'NNode'
+        # generate conditions from the MIDAS 
+        self._initialize_conditions()
 
     def _initialize_conditions(self):
         """ initialize the conditions for the ODE model simulation
@@ -92,24 +89,26 @@ class NNODE(CNOBase):
         stimulated, inhibited and measured nodes, the initial values and the time range.
         Must be called if MIDAS(self.midas) or network (self._model) changes to adjust initial conditions.
         """
-        midas = self.midas
-
+        
         # convert the conditions from the pandas dataframe to a list of dictionaries
-        stimuli = midas.experiments.Stimuli
-        inhibitors = midas.experiments.Inhibitors
-
-        names_stimuli = midas.names_stimuli
-        names_inhibitors = midas.names_inhibitors
+        stimuli = self.midas.experiments.Stimuli
+        inhibitors = self.midas.experiments.Inhibitors
+        names_stimuli = self.midas.names_stimuli
+        names_inhibitors = self.midas.names_inhibitors
+        
+        # measurements_index is the index of the measured nodes in the state variabels. Needed to subset the simulation results fast. 
+        self.measurements_index = [ self.states.index(x) if x in self.states else None for x in self.midas.names_signals]
 
         conditions = list()
-        for iexp in range(midas.nExps):
+        for iexp in range(self.midas.nExps):
             stimulated = list(itertools.compress(names_stimuli,stimuli.iloc[iexp,:]==1))
             inhibited = list(itertools.compress(names_inhibitors,inhibitors.iloc[iexp,:]==1))
-            measured = list(midas.names_signals)
-            time = midas.times
+            measured = list(self.midas.names_signals)
+            time = self.midas.times
             y0 = self._initialize_y0(self._model.species, stimulated, inhibited)
             conditions.append(dict(stimulated=stimulated, inhibited=inhibited, measured=measured, time=time, y0=y0))
         self.conditions = conditions
+        
         self.measurements_df = jnp.array(self.midas.df.to_numpy(),dtype=jnp.float32)
       
 
@@ -145,9 +144,7 @@ class NNODE(CNOBase):
 
         # store states in fixed order: 
         self.states = tuple([str(s) for s in states])      
-        # measurements_index is the index of the measured nodes in the state variabels. Needed to subset the simulation results fast. 
-        self.measurements_index = [ self.states.index(x) if x in self.states else None for x in self.midas.names_signals]
-
+        
         self.symbolicODE = dict(pars=pars, states=states, eqns=eqns)
 
         # generate the numerical parameter vector from the symbolic parameters
@@ -231,20 +228,39 @@ class NNODE(CNOBase):
             self.transfer_function = graph2symODE.transfer_function_linear_fun
         #CNORodePBMstNeu
 
-    
+    # get the y0 from the conditions as a numpy array
+    def get_y0(self):
+        y0 = jnp.array([jnp.array(list(c['y0'].values())) for c in self.conditions])
+        return y0
+
+    def get_inhibited_species(self):
+        """ Returns an indicator array for the inhibited species. 
+        
+        returns:
+            numpy array of shape (n_conditions, n_species), where the entry i,j is 1 if the species j is inhibited in condition i, 0 otherwise.
+
+        """
+        inhibited = np.zeros((len(self.conditions),len(self.states)))
+        for i in range(len(self.conditions)):            
+            for j in range(len(self.conditions[i]["inhibited"])):
+                inhibited[i,self.states.index(self.conditions[i]["inhibited"][j])] = 1
+
+        return(inhibited)
 
     def get_rhs_function(self):
         """ Generate a right hand side function compatible with Diffrax """
         
         f_jax = self.jax_model[0]
         f_jax_p = self.jax_model[1]
+        states = self.states
+
 
         def f(t, y, args):
             # get users data containinf the jax objects and model parameters: 
             #f_jax = args["jax_eqns"]
             #f_jax_p = args["jax_parameters"]
             parameter_vals = args["model_parameters"]
-            states = args["states"]
+            condition = args["condition"]
 
             #jax_pars = jnp.concatenate((parameter_vals,y))
             jax_pars = [*parameter_vals,*y]
@@ -252,7 +268,7 @@ class NNODE(CNOBase):
 
             for i in range(len(y)):
                 
-                if states[i] in args["condition"]["inhibited"]:
+                if states[i] in condition["inhibited"]:
                     fy.append(jnp.array([0.0,])[0])
                 elif f_jax[i] == 0:
                     fy.append(jnp.array([0.0,])[0])
@@ -268,7 +284,48 @@ class NNODE(CNOBase):
         # this is when jax generates the graph, takes some time. 
         self.sim_function = self.get_rhs_function()
         self._diffrax_ODEterm = diffrax.ODETerm(self.sim_function)
+        
 
+        self.vectorized_simulation = self.get_vectorized_simulation()
+
+        self.simulate_all_conditions = jax.vmap(self.vectorized_simulation,in_axes=(None,0,0)) 
+
+        self.y0_array = self.get_y0()
+        self.inhibited_array = self.get_inhibited_species()
+
+    def get_vectorized_simulation(self):
+        f_jax = self.jax_model[0]
+        f_jax_p = self.jax_model[1]
+
+        jax.jit
+        def simulate(pars,y0,inhibited_states):
+    
+            @jax.jit
+            def rhs_function( t, y, args):  
+                X = [*pars,*y]
+                dy = list()
+                for i in range(len(y)):
+                    if f_jax[i] == 0:
+                        dy.append(jnp.array([0.0,])[0])
+                    else:
+                        dy.append((1.0-inhibited_states[i])*f_jax[i](jnp.array([X,]),f_jax_p[i])[0])
+
+                return jnp.asarray(dy)
+            
+            ts = self.midas.times
+
+            sol = diffrax.diffeqsolve(
+                diffrax.ODETerm(rhs_function),
+                diffrax.Heun(),
+                ts[0],
+                ts[-1],
+                dt0=0.1,
+                y0 = y0,
+                stepsize_controller =diffrax.ConstantStepSize(),
+                saveat=diffrax.SaveAt(ts=ts),
+            )
+            return(sol.ys)
+        return simulate
 
     def simulate(self, ODEparameters=None, timepoints = None, stepsize_controller =diffrax.ConstantStepSize(), plot_simulation = False):
         """Simulate the model with the given parameters and conditions
@@ -305,25 +362,20 @@ class NNODE(CNOBase):
         else: 
             raise TypeError("ODEparameters must be a dictionary or a jax.numpy.ndarray")
 
-        sim_conditions = self.conditions.copy()
-
         if timepoints is not None:
-            for c in sim_conditions:
+            for c in self.conditions:
                 c["time"] = timepoints
             
         # run the simulation for each condition
         simulation_data = list()
         ODEsolver = diffrax.Heun()
-        
         ODEterm = self._diffrax_ODEterm 
-        #jax_model = self.jax_model
-        states = self.states
 
-        for c in sim_conditions:
+
+        for c in self.conditions:
             # run the simulation in a specific condition
             user_data = dict(model_parameters = parameters,
-                            condition = c,
-                            states = states
+                            condition = c
                             )
             t0 = c["time"][0]
             t1 = c["time"][-1]
@@ -342,7 +394,9 @@ class NNODE(CNOBase):
         
         if plot_simulation is True:
             self.plot_simulation(simulation_data)
+
         return simulation_data
+
 
     def plot_simulation(self, simulation_data):
         """Plot the simulation data"""
@@ -410,53 +464,85 @@ class NNODE(CNOBase):
         return params
 
     def setup_optimization(self):
-        self.loss_function = self.get_loss_function()
-
-    def get_loss_function(self):
-        """Returns the loss function"""
+        """Setup the optimization problem
         
-        def loss(params):
-            lb = self.ODEparameters_lb
-            ub = self.ODEparameters_ub
-            dz = self.ODEparameters_dz
-
-            mse = 0.0
-            # penalize the parameters that are approaching the boundaries
-            for i in range(len(params)):
-                # if the parameter is close to the lower boundary, add a penalty
-                # lb[i]+dz[i] is the soft limit where the penalty is added
-                # we scale the interval between the soft and hard limit using tangent function that goes to infinite. 
-                # we add a multiplicative factor of 0.99 to prevent the penalty from being infinite an overloating.
-                if params[i] <= lb[i]+dz[i]:
-                    dept = (params[i]-lb[i])/dz[i]
-                    penalty = 1e3*jnp.power(dept,2)
-                    #penalty = jnp.tan(dept * jnp.pi/2 * 0.99)
-                    mse += penalty
-                    # print(f"WARNING: Parameter {i} is close to the lower boundary. Adding penalty {penalty}")
-
-                elif params[i] > ub[i]-dz[i]:
-                    dept = (ub[i] - params[i])/dz[i]
-                    #penalty = jnp.tan(dept * jnp.pi/2 * 0.99)
-                    penalty = 1e3*jnp.power(dept,2)
-                    mse += penalty
-                    # print(f"WARNING: Parameter {i} is close to the upper boundary. Adding penalty {penalty}")
-
-
-
-            # assure that parameters are within bounds for the simulation
-            params = jnp.clip(params, lb, ub)
+        This initializes the self.loss_function and self.loss_function_grad
+        
+        """
+        f_jax = self.jax_model[0]
+        f_jax_p = self.jax_model[1]
+        lb = self.ODEparameters_lb
+        ub = self.ODEparameters_ub
+        dz = self.ODEparameters_dz
+        
+        @jax.jit
+        def simulate(pars,y0,inhibited_states):
             
-            simulation_data = self.simulate(ODEparameters = params)
+            @jax.jit
+            def rhs_function( t, y, args):  
+                X = [*pars,*y]
+                dy = list()
+                for i in range(len(y)):
+                    if f_jax[i] == 0:
+                        dy.append(jnp.array([0.0,])[0])
+                    else:
+                        dy.append((1.0-inhibited_states[i])*f_jax[i](jnp.array([X,]),f_jax_p[i])[0])
 
-             # extract the simulation data from the output of diffrax solution and subset it to the measured nodes. 
-            simulation_df = jnp.concatenate([jnp.asarray(s.ys[:,self.measurements_index]) for s in simulation_data])
-        
+                return jnp.asarray(dy)
+            
+            ts = self.midas.times
+
+            sol = diffrax.diffeqsolve(
+                diffrax.ODETerm(rhs_function),
+                diffrax.Heun(),
+                ts[0],
+                ts[-1],
+                dt0=0.1,
+                y0 = y0,
+                stepsize_controller =diffrax.ConstantStepSize(),
+                saveat=diffrax.SaveAt(ts=ts),
+            )
+            return(sol.ys)
+
+        # map the simulation across the conditions
+        simulate_all_map = jax.vmap(simulate,in_axes=(None,0,0))
+
+        @jax.jit
+        def bound_penalty(params):
+            p = jnp.where(params < lb+dz, 1, 0) * jnp.power((params-lb)/dz,2)*1e3
+            p += jnp.where(params > ub-dz, 1, 0) * jnp.power((ub-params)/dz,2)*1e3
+            return(p.sum())
+
+        @jax.jit
+        def fit_penalty(params):
+            params = jnp.clip(params, lb, ub)
+
+            #v_sim = jax.vmap(simulate,in_axes=(None,0))
+            simulation_data = simulate_all_map(params,self.y0_array,self.inhibited_array)
+            
+            # extract the simulation data from the output of diffrax solution and subset it to the measured nodes. 
+            simulation_df = jnp.concatenate([s[:,self.measurements_index] for s in simulation_data])
+
             sq = jnp.power(simulation_df-self.measurements_df,2)
-            mse += jnp.sum(sq)/jnp.size(sq)
+            return jnp.sum(sq)/jnp.size(sq)
+        
+        @jax.jit
+        def loss(params):
+            
+            # assure that parameters are within bounds for the simulation
+            mse_penalty = bound_penalty(params) 
+
+            mse =  fit_penalty(params)  + mse_penalty
 
             return mse
+
+        self.loss_function = loss
+        self.loss_function_grad = jax.grad(loss)
+
+
         
-        return loss
+
+
 
 
 
