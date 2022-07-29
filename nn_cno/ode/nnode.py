@@ -226,7 +226,7 @@ class logicODE(CNOBase):
             self.transfer_function = graph2symODE.transfer_function_norm_hill_fun
         elif transfer_function_type == "linear":
             self.transfer_function = graph2symODE.transfer_function_linear_fun
-        #CNORodePBMstNeu
+        
 
     # get the y0 from the conditions as a numpy array
     def get_y0(self):
@@ -248,7 +248,10 @@ class logicODE(CNOBase):
         return(inhibited)
 
     def get_rhs_function(self):
-        """ Generate a right hand side function compatible with Diffrax """
+        """ Generate a right hand side function compatible with Diffrax 
+        
+            This is a slower version of the simulation, not used for the optimization. 
+        """
         
         f_jax = self.jax_model[0]
         f_jax_p = self.jax_model[1]
@@ -277,7 +280,6 @@ class logicODE(CNOBase):
                
             return jnp.asarray(fy)
                 
-        
         return f
 
     def setup_simulation(self):
@@ -285,15 +287,10 @@ class logicODE(CNOBase):
         self.sim_function = self.get_rhs_function()
         self._diffrax_ODEterm = diffrax.ODETerm(self.sim_function)
         
+        
 
-        self.vectorized_simulation = self.get_vectorized_simulation()
-
-        self.simulate_all_conditions = jax.vmap(self.vectorized_simulation,in_axes=(None,0,0)) 
-
-        self.y0_array = self.get_y0()
-        self.inhibited_array = self.get_inhibited_species()
-
-    def get_vectorized_simulation(self):
+    def _get_vectorized_simulation(self):
+        """ Get a simulation function that is JIT-ted"""
         f_jax = self.jax_model[0]
         f_jax_p = self.jax_model[1]
 
@@ -475,6 +472,9 @@ class logicODE(CNOBase):
         ub = self.ODEparameters_ub
         dz = self.ODEparameters_dz
         
+        self.y0_array = self.get_y0()
+        self.inhibited_array = self.get_inhibited_species()
+
         @jax.jit
         def simulate(pars,y0,inhibited_states):
             
