@@ -8,7 +8,7 @@ import diffrax
 
 
 # load the network 
-c = ode.NNODE("./nn_cno/datasets/working_case_study/PKN-test.sif",
+c = ode.logicODE("./nn_cno/datasets/working_case_study/PKN-test.sif",
     "./nn_cno/datasets/working_case_study/MD-test.csv")
 
 c.preprocessing(expansion=False)
