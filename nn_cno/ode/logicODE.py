@@ -411,10 +411,8 @@ class logicODE(CNOBase):
                 if istate == 0:
                     axs[istate,icond].set_title("condition " + str(icond))
 
-    def fit(self, params=None, optimizer=None, max_iter=100, boundary_handling = "penalty",  verbose=False, plot_convergence=False):
+    def fit(self, params=None, optimizer=optax.adam(learning_rate=1e-2), max_iter=100, boundary_handling = "penalty",  verbose=False, plot_convergence=False):
 
-        if optimizer is None:
-            optimizer = optax.adam(learning_rate=1e-2)
         
         if(params is None):
             params = jnp.array(list(self.get_ODEparameters().values()))
@@ -437,28 +435,37 @@ class logicODE(CNOBase):
 
             updates, opt_state = optimizer.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
-            return params, opt_state, loss_value
+            return params, opt_state, loss_value, grads
 
         convergence = list()
         steps = list()
-        
+        opt_params = params
+        opt_loss = np.Inf
+
         for i in range(max_iter):
-            params, opt_state, loss_value = step(params, opt_state)
+            params, opt_state, loss_value, grad_value = step(params, opt_state)
             convergence.append(loss_value)
             steps.append(i)
+            
+            if loss_value < opt_loss:
+                opt_params = params
+                opt_loss = loss_value
             
             if(plot_convergence is True):
                 axs.set_xlim(0,i)
                 axs.cla()
                 axs.plot(steps,convergence, marker = "o")
+                axs.plot(i,opt_loss, marker = "o", color = "red")
                 display(fig)
                 clear_output(wait=True)
                 
+            if i % 100 == 0:
+                print('  {:<5} \t {:<9} \t {:<9}\t {:<9}'.format( "iter", 	 "current loss", 	 "min. loss", 	 "grad norm"))
             if i % 10 == 0:
-                print(f'step {i}, loss: {loss_value}')
-                print(f'\tparams: {params}')
+                print('  {:<5d} \t {:<9.4e} \t {:<9.4e} \t {:<9.4e}'.format(i, loss_value, opt_loss, jnp.linalg.norm(grad_value)))
+                
 
-        return params
+        return opt_params
 
     def setup_optimization(self):
         """Setup the optimization problem
