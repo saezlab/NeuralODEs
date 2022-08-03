@@ -56,6 +56,7 @@ class temp_network():
 
         self._importNetwork(networkFile, banList)
         self._importNodeAnnotation(nodeAnnotationFile)
+        self.trainingParameters = trainingParameters()
 
     def _importNodeAnnotation(self, nodeAnnotationFile):
         # assure networkAnnotationFile is an existing file:
@@ -105,6 +106,7 @@ class temp_network():
         self.modeOfAction = modeOfAction
     
     def plot(self):
+        """ plot the adjacency matrix of the network with spy."""
         plt.spy(self.A)
         plt.xticks(range(len(self.nodeNames)), self.nodeNames, size='small', rotation=90)
         plt.yticks(range(len(self.nodeNames)), self.nodeNames, size='small')
@@ -128,3 +130,24 @@ class temp_network():
         networkList = np.array((networkList[1], networkList[0]))  #0 == Target 1 == Source due to numpy sparse matrix structure
         return networkList, nodeNames, weights
 
+class trainingParameters():
+
+    def __init__(self,iterations = 150, clipping=1, leak=0.01,targetPrecision = 1.0e-4, spectralTarget=None) -> None:
+      
+        #set defaults
+        params = {'iterations': iterations, 
+                    'leak': leak,
+                    'clipping': clipping,
+                    'targetPrecision': targetPrecision}
+
+        if spectralTarget is None:
+            params['spectralTarget'] = np.exp(np.log(params['targetPrecision'])/params['iterations'])
+
+        self.parameters = params
+        
+    # getter and setter for parameters
+    def get_parameters(self, name):
+        return self.parameters[name]
+
+    def set_parameters(self, name, value):
+        self.parameters[name] = value
