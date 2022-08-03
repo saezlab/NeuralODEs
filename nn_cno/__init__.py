@@ -37,6 +37,10 @@ from .core import *
 # ODE
 from .ode import cnorode, CNORode, logicODE
 
+# Neural network based models
+from .nn_models import rnnModel
+
+
 # fuzzy
 #from .fuzzy import cnorfuzzy, CNORfuzzy
 
