@@ -17,7 +17,7 @@ from jax.experimental import sparse
 import equinox as eqx
 import matplotlib.pyplot as plt
 import optax
-
+from functools import partial
 import os
 
 
@@ -220,6 +220,26 @@ class outputProjectionLayer(eqx.Module):
            # probably we dont need to address batch dimensions, because we could just use jnp.vmap for that in the loss. 
         return self.weights * x[:, self.inOutIndices]
 
+
+# Helper function for recurrentLayer
+@partial(jax.jit, static_argnums=(2,3))
+def _simulate_recurrentLayer(A,bIn,activation,iterations):
+        # xhat is also a column vector
+        xhat = jnp.zeros(bIn.shape)
+
+        def propagate(y,_):
+            y = A @ y + bIn
+            y = activation(y)
+            return(y,_)
+
+        xhat, _ = jax.lax.scan(f=propagate,init=xhat,length=iterations,xs=None)
+
+        return xhat
+
+
+
+
+
 class recurrentLayer(eqx.Module):
     """Recurrent layer simulating the difference equation."""
 
@@ -269,7 +289,7 @@ class recurrentLayer(eqx.Module):
         # TODO: add the others
         self.activation = self.get_activation_function()
 
-    def __call__(self, x):
+    def old_call(self, x):
         
         self.A.data = self.weights
         
@@ -278,8 +298,6 @@ class recurrentLayer(eqx.Module):
 
         # xhat is also a column vector
         xhat = jnp.zeros(bIn.shape)
-
-        xhatBefore = xhat.copy()
 
         for i in range(self.iterations):
             #if i>40: #normally takes around 40 iterations to reach steady state
@@ -292,9 +310,27 @@ class recurrentLayer(eqx.Module):
             # activation should preserve the dimensionality of the input
             xhat = self.activation(xhat)
 
+    
         # we should return a row vector to be consistent with the input and other layers. 
         return xhat.T
     
+    def __call__(self, x):
+        
+        self.A.data = self.weights
+        
+        # x comes in as a row vector, but we need a column vector.
+        bIn = x.T + self.biases
+    
+        xhat = _simulate_recurrentLayer(A = self.A,
+                        bIn = bIn,
+                        activation = self.activation,
+                        iterations = self.iterations)
+    
+        # we should return a row vector to be consistent with the input and other layers. 
+        return xhat.T
+    
+    
+
 
     def getViolations(self, weights = None):
         if weights == None:
@@ -326,12 +362,15 @@ class recurrentLayer(eqx.Module):
         return weights, bias
 
     def get_activation_function(self):
-        def MMLactivation(x):
-            
-            x = jnp.where(x < 0, x * self.leak, x)
+        
+        leak = self.leak
+        @jax.jit
+        def _MMLactivation(x):
+            x = jnp.where(x < 0, x * leak, x)
             x = jnp.where(x > 0.5, 1 - 0.25/x, x) #Pyhton will display division by zero warning since it evaluates both before selecting
             return x
-        return MMLactivation
+        
+        return _MMLactivation
 
 
 class temp_network():
@@ -480,7 +519,7 @@ class OptimProgress():
             raise ValueError("storage is full.")
             
         e = self.currentEpoch
-        
+
         if loss != None:
             self.stats['loss'][e] = np.mean(np.array(loss))
             self.stats['lossSTD'][e] = np.std(np.array(loss))
