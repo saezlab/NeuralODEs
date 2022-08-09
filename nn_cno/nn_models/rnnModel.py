@@ -137,6 +137,7 @@ class BionetworkModel(eqx.Module):
         
     
     def __call__(self, x):
+        
         for layer in self.layers:
             x = layer(x)
         return x
@@ -178,9 +179,11 @@ class inputProjectionLayer(eqx.Module):
         # FIX: this leads to jax.errors.TracerArrayConversionError
         # y = np.zeros([x.shape[0],  self.size_out])
         # y[:, self.inOutIndices] = self.weights * x
-
-        y = jnp.zeros([x.shape[0],  self.size_out])
-        return y.at[:, self.inOutIndices].set(self.weights * x)
+        # jnp.array(y)
+        
+        print("input shape:{}".format(x.shape))
+        y = jnp.zeros([1,  self.size_out])
+        return y.at[0, self.inOutIndices].set((self.weights * x).flatten())
 
         
 
@@ -292,6 +295,13 @@ class recurrentLayer(eqx.Module):
         # we should return a row vector to be consistent with the input and other layers. 
         return xhat.T
     
+
+    def getViolations(self, weights = None):
+        if weights == None:
+            weights = self.weights
+        wrongSignActivation = jnp.logical_and(weights<0, self.modeOfAction[0] == True)#.type(torch.int)
+        wrongSignInhibition = jnp.logical_and(weights>0, self.modeOfAction[1] == True)#.type(torch.int)
+        return jnp.logical_or(wrongSignActivation, wrongSignInhibition)
  
 
         
@@ -423,5 +433,71 @@ class trainingParameters():
         
         if spectralTarget is None:
             self.spectralTarget = np.exp(np.log(self.targetPrecision)/self.iterations)
+
+
+class OptimProgress():
+    def __init__(self, maxIter):
+        import time
+        stats = {}
+        stats['startTime'] = time.time()
+        stats['endTime'] = 0
+        stats['loss'] = float('nan')*np.ones(maxIter)
+        stats['lossSTD'] = float('nan')*np.ones(maxIter)
+        stats['eig'] = float('nan')*np.ones(maxIter)
+        stats['eigSTD'] = float('nan')*np.ones(maxIter)
+
+        stats['test'] = float('nan')*np.ones(maxIter)
+        stats['rate'] = float('nan')*np.ones(maxIter)
+        stats['violations'] = float('nan')*np.ones(maxIter)
+
+        self.stats = stats
+        self.maxIter = maxIter
+        self.currentEpoch = 0
+
+    def printStats(self, e = None):
+
+        if e is None: 
+            if self.currentEpoch == 0:
+                print("no data stored yet")
+                return
+            e = self.currentEpoch-1
+        
+        outString = 'i={:.0f}'.format(e)
+        if np.isnan(self.stats['loss'][e]) == False:
+            outString += ', l={:.5f}'.format(self.stats['loss'][e])
+        if np.isnan(self.stats['test'][e]) == False:
+            outString += ', t={:.5f}'.format(self.stats['test'][e])
+        if np.isnan(self.stats['eig'][e]) == False:
+            outString += ', s={:.3f}'.format(self.stats['eig'][e])
+        if np.isnan(self.stats['rate'][e]) == False:
+            outString += ', r={:.5f}'.format(self.stats['rate'][e])
+        if np.isnan(self.stats['violations'][e]) == False:
+            outString += ', v={:.0f}'.format(self.stats['violations'][e])
+        print(outString)
+
+    def storeProgress(self, loss=None, eig=None, lr=None, violations=None, test=None):
+        if(self.currentEpoch > self.maxIter):
+            raise ValueError("storage is full.")
+            
+        e = self.currentEpoch
+        
+        if loss != None:
+            self.stats['loss'][e] = np.mean(np.array(loss))
+            self.stats['lossSTD'][e] = np.std(np.array(loss))
+
+        if eig != None:
+            self.stats['eig'][e] = np.mean(np.array(eig))
+            self.stats['eigSTD'][e] = np.std(np.array(eig))
+
+        if lr != None:
+            self.stats['rate'][e] = lr
+
+        if violations != None:
+            self.stats['violations'][e] = violations
+
+        if test != None:
+            self.stats['test'][e] = test
+        
+        self.currentEpoch += 1
 
         
