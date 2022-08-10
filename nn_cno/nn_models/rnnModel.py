@@ -237,9 +237,6 @@ def _simulate_recurrentLayer(A,bIn,activation,iterations):
         return xhat
 
 
-
-
-
 class recurrentLayer(eqx.Module):
     """Recurrent layer simulating the difference equation."""
 
@@ -267,6 +264,8 @@ class recurrentLayer(eqx.Module):
         
         - `modeOfAction`: vector of signs of the interactions.
         - `networkList`: adjacency matrix of the network.
+        - `iterations`: number of iterations.
+        - `leak`: leak parameter of the activation function.
         """
         super().__init__()
         
@@ -285,34 +284,10 @@ class recurrentLayer(eqx.Module):
         # https://jax.readthedocs.io/en/latest/jax.experimental.sparse.html
         scipyA =  sp.sparse.csr_matrix((weights, networkList), shape=(nStates, nStates))
         self.A = sparse.BCOO.from_scipy_sparse(scipyA)
+
         # Activition function
         # TODO: add the others
         self.activation = self.get_activation_function()
-
-    def old_call(self, x):
-        
-        self.A.data = self.weights
-        
-        # x comes in as a row vector, but we need a column vector.
-        bIn = x.T + self.biases
-
-        # xhat is also a column vector
-        xhat = jnp.zeros(bIn.shape)
-
-        for i in range(self.iterations):
-            #if i>40: #normally takes around 40 iterations to reach steady state
-            #    if i>41:
-            #        if jnp.sum(jnp.abs(xhat-xhatBefore))<1e-6:
-            #            break            
-            #    xhatBefore = xhat.copy()            
-            # this should be a matrix times a column vector: 
-            xhat = self.A @ xhat + bIn
-            # activation should preserve the dimensionality of the input
-            xhat = self.activation(xhat)
-
-    
-        # we should return a row vector to be consistent with the input and other layers. 
-        return xhat.T
     
     def __call__(self, x):
         
@@ -329,18 +304,20 @@ class recurrentLayer(eqx.Module):
         # we should return a row vector to be consistent with the input and other layers. 
         return xhat.T
     
-    
-
 
     def getViolations(self, weights = None):
+        """Returns the violations of the mode action constraints.
+        
+        This constraint is violated when the sign of the weight is not equal to the sign of the mode of action.
+        
+        **Arguments:**
+        - `weights`: The weights of the network.
+        """
         if weights == None:
             weights = self.weights
         wrongSignActivation = jnp.logical_and(weights<0, self.modeOfAction[0] == True)#.type(torch.int)
         wrongSignInhibition = jnp.logical_and(weights>0, self.modeOfAction[1] == True)#.type(torch.int)
         return jnp.logical_or(wrongSignActivation, wrongSignInhibition)
- 
-
-        
 
     def initializeWeights(self):
         """ initialize the weights of the recurrent layer """
