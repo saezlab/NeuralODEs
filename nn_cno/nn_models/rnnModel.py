@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 import optax
 from functools import partial
 import os
-
+import jax.tree_util as jtu
 
 __all__ = ["bioNetwork"]
 
