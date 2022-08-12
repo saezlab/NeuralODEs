@@ -371,8 +371,8 @@ class temp_network():
             raise ValueError("networkAnnotationFile must be an existing file")
 
         annotation = pd.read_csv(nodeAnnotationFile, sep='\t', low_memory=False)
-        inName = annotation.loc[annotation.ligand, 'name'].values
-        outName = annotation.loc[annotation.TF, 'name'].values
+        inName = annotation.loc[annotation.ligand, 'code'].values
+        outName = annotation.loc[annotation.TF, 'code'].values
         
         self._annotation = annotation
         self.inName = inName
@@ -414,7 +414,9 @@ class temp_network():
     
     def plot(self):
         """ plot the adjacency matrix of the network with spy."""
-        plt.spy(self.A)
+
+        plt.spy(self.A, marker="o", markersize=1, color="black")
+        
         plt.xticks(range(len(self.nodeNames)), self.nodeNames, size='small', rotation=90)
         plt.yticks(range(len(self.nodeNames)), self.nodeNames, size='small')
         plt.xlabel("Target")

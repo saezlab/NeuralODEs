@@ -130,3 +130,4 @@ dmypy.json
 
 .DS_Store
 NN_cellnopt.code-workspace
+notebooks/synthNetScreen
