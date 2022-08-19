@@ -235,14 +235,14 @@ class outputProjectionLayer(eqx.Module):
 @partial(jax.jit, static_argnums=(2,3))
 def _simulate_recurrentLayer(A,bIn,activation,iterations):
         # xhat is also a column vector
-        xhat = jnp.zeros(bIn.shape)
+        x0 = jnp.zeros(bIn.shape)
 
         def propagate(y,_):
             y = A @ y + bIn
             y = activation(y)
             return(y,_)
 
-        xhat, _ = jax.lax.scan(f=propagate,init=xhat,length=iterations,xs=None)
+        xhat, _ = jax.lax.scan(f=propagate,init=x0,length=iterations,xs=None)
 
         return xhat
 
@@ -362,7 +362,7 @@ class recurrentLayer(eqx.Module):
                 0.5 < x :      1-0.25/x
             """
             x = jnp.where(x < 0, x * leak, x)
-            x = jnp.where(x > 0.5, 1 - 0.25/x, x) #Pyhton will display division by zero warning since it evaluates both before selecting
+            x = jnp.where(x > 0.5, 1 - 0.25/(jnp.where(x>0,x,1)), x) #Pyhton will display division by zero warning since it evaluates both before selecting
             return x
         
         return _MMLactivation
@@ -379,7 +379,7 @@ class recurrentLayer(eqx.Module):
             y = numpy.ones(x.shape) #derivative = 1 if nothing else is stated
             y = numpy.where(x <= 0, leak, y)  #let derivative be 0.01 at x=0
             
-            y = numpy.where(x > 0.5, 0.25/(x**2), y)
+            y = numpy.where(x > 0.5, 0.25/(jnp.where(x>0,x,1)**2), y)
             return y
         return _MMLoneStepDeltaActivation
 
