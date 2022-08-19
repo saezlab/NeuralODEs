@@ -138,6 +138,16 @@ class BionetworkModel(eqx.Module):
     
     def __call__(self, x):
         
+        x = self.layers[0](x)
+        y_full = self.layers[1](x)
+        y = self.layers[2](y_full)
+
+        # for layer in self.layers:
+        #     x = layer(x)
+        return y, y_full
+    
+    def call_old(self, x):
+        
         for layer in self.layers:
             x = layer(x)
         return x
@@ -181,7 +191,7 @@ class inputProjectionLayer(eqx.Module):
         # y[:, self.inOutIndices] = self.weights * x
         # jnp.array(y)
         
-        print("input shape:{}".format(x.shape))
+        #print("input shape:{}".format(x.shape))
         y = jnp.zeros([1,  self.size_out])
         return y.at[0, self.inOutIndices].set((self.weights * x).flatten())
 
@@ -250,6 +260,7 @@ class recurrentLayer(eqx.Module):
     leak: float = eqx.static_field()
     A: sparse.BCOO = eqx.static_field()
     activation: Callable = eqx.static_field()
+    oneStepDeltaActivation: Callable = eqx.static_field()
 
     def __init__(
         self,
@@ -288,6 +299,7 @@ class recurrentLayer(eqx.Module):
         # Activition function
         # TODO: add the others
         self.activation = self.get_activation_function()
+        self.oneStepDeltaActivation = self.get_oneStepDeltaActivation_function()
     
     def __call__(self, x):
         
@@ -339,15 +351,64 @@ class recurrentLayer(eqx.Module):
         return weights, bias
 
     def get_activation_function(self):
+        """ returns the jit-ted activation function """
         
         leak = self.leak
         @jax.jit
         def _MMLactivation(x):
+            """ activation function F(x):
+                x < 0:        leak * x
+                0 < x < 0.5 : x
+                0.5 < x :      1-0.25/x
+            """
             x = jnp.where(x < 0, x * leak, x)
             x = jnp.where(x > 0.5, 1 - 0.25/x, x) #Pyhton will display division by zero warning since it evaluates both before selecting
             return x
         
         return _MMLactivation
+    def get_oneStepDeltaActivation_function(self):
+        """ returns the jit-ted derivative of the activation function """
+        leak = self.leak
+        @jax.jit
+        def _MMLoneStepDeltaActivation(x, leak):
+            """ derivative of the activation function F(x):
+                x < 0:        leak 
+                0 < x < 0.5 : 1
+                0.5 < x :      0.25/x^2
+            """
+            y = numpy.ones(x.shape) #derivative = 1 if nothing else is stated
+            y = numpy.where(x <= 0, leak, y)  #let derivative be 0.01 at x=0
+            
+            y = numpy.where(x > 0.5, 0.25/(x**2), y)
+            return y
+        return _MMLoneStepDeltaActivation
+
+    def getSpectralRadius(self, weights):
+        """Returns the spectral radius of the network.
+        
+        **Arguments:**
+        - `weights`: The weights of the network.
+        """
+
+        compute_radius(weights,self.A, self.networkList)
+
+        return np.max(np.abs(np.linalg.eigvals(weights)))
+
+
+@jax.jit
+def compute_radius(w,A,ind):
+    A = A.at[ind[0],ind[1]].set(w)
+    e_val =  jnp.linalg.eigvals(A)
+    return jnp.max(jnp.abs(e_val))
+
+@jax.jit
+def compute_spectral_loss(w,A,ind):
+    radius = compute_radius(w,A,ind)
+    l = errorSize * scaleFactor * (jnp.exp(expFactor*radius)-1)
+    return l, radius
+
+compute_loss_vg = jax.value_and_grad(compute_spectral_loss,has_aux=True)
+
 
 
 class temp_network():
@@ -365,18 +426,7 @@ class temp_network():
         self.nOutputs = len(self.outName)
         
 
-    def _importNodeAnnotation(self, nodeAnnotationFile):
-        # assure networkAnnotationFile is an existing file:
-        if not os.path.isfile(nodeAnnotationFile):
-            raise ValueError("networkAnnotationFile must be an existing file")
-
-        annotation = pd.read_csv(nodeAnnotationFile, sep='\t', low_memory=False)
-        inName = annotation.loc[annotation.ligand, 'code'].values
-        outName = annotation.loc[annotation.TF, 'code'].values
-        
-        self._annotation = annotation
-        self.inName = inName
-        self.outName = outName
+    
 
 
     def _importNetwork(self, networkFile, banList= []):
@@ -412,6 +462,38 @@ class temp_network():
         self.nodeNames = nodeNames
         self.modeOfAction = modeOfAction
     
+    
+    def _importNodeAnnotation(self, nodeAnnotationFile):
+        # assure networkAnnotationFile is an existing file:
+        if not os.path.isfile(nodeAnnotationFile):
+            raise ValueError("networkAnnotationFile must be an existing file")
+
+        annotation = pd.read_csv(nodeAnnotationFile, sep='\t', low_memory=False)
+        inName = annotation.loc[annotation.ligand, 'code'].values
+        outName = annotation.loc[annotation.TF, 'code'].values
+
+        # check and report if the inName is not in the nodeNames, then remove the missing nodes
+        if not set(inName).issubset(set(self.nodeNames)):
+            # detect which are not in the nodeNames
+            notIn = set(inName).difference(set(self.nodeNames))
+            #write warning about the not in nodes
+            print("The following input nodes are not in the network: " + str(notIn))
+        #remove the not in nodes from the inName
+        inName = np.intersect1d(self.nodeNames, inName)
+
+        # check and report if the outName is not in the nodeNames, then remove the missing nodes
+        if not set(outName).issubset(set(self.nodeNames)):
+            # detect which are not in the nodeNames
+            notIn = set(outName).difference(set(self.nodeNames))
+            #write warning about the not in nodes
+            print("The following input nodes are not in the network: " + str(notIn))
+        #remove the not in nodes from the outName   
+        outName = np.intersect1d(self.nodeNames, outName)
+        
+        self._annotation = annotation
+        self.inName = inName
+        self.outName = outName
+
     def plot(self):
         """ plot the adjacency matrix of the network with spy."""
 
